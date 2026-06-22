@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
 from supabase import Client
 from datetime import datetime, timezone
+import os
 import uuid
 
 from app.core.auth import get_current_user, get_supabase
@@ -13,8 +14,21 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 FREE_TIER_LIMIT = 1  # free users get 1 review
 
 
-def check_usage_limit(user_id: str, supabase: Client) -> None:
+def get_admin_emails() -> set:
+    from app.core.config import get_settings
+    settings = get_settings()
+    raw = settings.admin_emails
+    parsed = {e.strip().lower() for e in raw.split(",") if e.strip()}
+    print(f"DEBUG: ADMIN_EMAILS from settings = {raw!r}, parsed = {parsed}")
+    return parsed
+
+
+def check_usage_limit(user_id: str, user_email: str, supabase: Client) -> None:
     """Raise 402 if free user has hit their review limit."""
+    # Admin allowlist — always unlimited, skip every other check
+    if user_email and user_email.lower() in get_admin_emails():
+        return
+
     # Check subscription
     sub = supabase.table("subscriptions") \
         .select("plan") \
@@ -69,8 +83,9 @@ async def create_review(
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large. Maximum size is 10MB")
 
-    # 2. Check usage limit (free tier)
-    check_usage_limit(user["id"], supabase)
+    # 2. Check usage limit (free tier, bypassed for admin emails)
+    print(f"DEBUG: uploading user email = {user.get('email', 'NONE')!r}")
+    check_usage_limit(user["id"], user.get("email", ""), supabase)
 
     # 3. Extract text
     try:

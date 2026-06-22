@@ -8,7 +8,9 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
-
+Q.PY
+New Text Document.txt
+*.txt
 # Test outputs
 tests/outputs/
 

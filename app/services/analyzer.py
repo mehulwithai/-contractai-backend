@@ -2,12 +2,74 @@ import json
 import os
 import anthropic
 from app.core.config import get_settings
+from typing import List, Literal, Optional
 
-# ─── MOCK MODE ───────────────────────────────────────────────────────────────
-# Set MOCK_AI=true in your .env to skip the Claude API entirely.
-# The full pipeline still runs — parse, store, respond — just with fake AI output.
-# Flip to false the moment your API credits arrive.
-_FORCE_MOCK = True
+# ─── NATIVE GEMINI SCHEMA DEFINITION ─────────────────────────────────────────
+# We use a raw dictionary schema because the Gemini Python SDK can misinterpret
+# Pydantic's default value wrappers, leading to 'Unknown field for Schema' errors.
+GEMINI_CONTRACT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {
+            "type": "STRING",
+            "description": "2-3 sentence plain-English overview of what this contract is and what it commits the user to"
+        },
+        "contract_type": {
+            "type": "STRING",
+            "enum": ["NDA", "Vendor Agreement", "Employment", "SaaS/Software", "Service Agreement", "Lease", "Other"]
+        },
+        "overall_risk": {
+            "type": "STRING",
+            "enum": ["low", "medium", "high"]
+        },
+        "parties": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"}
+        },
+        "key_dates": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "label": {"type": "STRING"},
+                    "date": {"type": "STRING", "description": "The date value, or an empty string if null"}
+                },
+                "required": ["label", "date"]
+            }
+        },
+        "flags": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "id": {"type": "INTEGER"},
+                    "title": {"type": "STRING"},
+                    "clause": {"type": "STRING", "description": "The exact problematic clause text, max 150 chars"},
+                    "issue": {"type": "STRING"},
+                    "severity": {"type": "STRING", "enum": ["red", "amber", "green"]},
+                    "suggestion": {"type": "STRING"}
+                },
+                "required": ["id", "title", "clause", "issue", "severity", "suggestion"]
+            }
+        },
+        "positives": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"}
+        },
+        "questions_to_ask": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"}
+        }
+    },
+    "required": ["summary", "contract_type", "overall_risk", "parties", "key_dates", "flags", "positives", "questions_to_ask"]
+}
+
+# ─── PROVIDER SWITCH ─────────────────────────────────────────────────────────
+# Set AI_PROVIDER in your .env to one of: mock | gemini | claude
+# - mock    → instant fake response, zero cost, zero API calls
+# - gemini  → real AI, free tier (no billing attached), good for early testing
+# - claude  → real AI, paid, used for production once credits/billing are set up
+
 MOCK_RESULT = {
     "summary": "This is a Non-Disclosure Agreement between Acme Corp and TechStartup Pvt Ltd. It commits TechStartup to keep Acme's business information confidential for 5 years, with extremely harsh penalties including a $500,000 fine per breach and a worldwide non-compete clause lasting 3 years after termination.",
     "contract_type": "NDA",
@@ -73,7 +135,7 @@ MOCK_RESULT = {
     "_meta": {
         "input_tokens": 0,
         "output_tokens": 0,
-        "model": "MOCK — set MOCK_AI=false and add API key to use Claude"
+        "model": "MOCK"
     }
 }
 
@@ -119,52 +181,103 @@ Severity guide:
 Return between 3 and 10 flags. Prioritize the most impactful issues."""
 
 
-def analyze_contract(contract_text: str) -> dict:
-    """
-    Send contract text to Claude and get back a structured risk analysis.
-    Returns a parsed dict ready to store in Supabase.
+def _clean_json_response(raw: str) -> str:
+    """Safely extracts JSON text from any conversational wrappers or markdown fences."""
+    raw = raw.strip()
 
-    If MOCK_AI=true in .env, returns a realistic fake response instantly.
-    """
-    # ── Mock mode check ──────────────────────────────────────────
-    mock = _FORCE_MOCK or os.getenv("MOCK_AI", "false").lower() == "true"
-    if mock:
-        return MOCK_RESULT.copy()
+    # Find the bounds of the actual JSON object
+    start_idx = raw.find('{')
+    end_idx = raw.rfind('}')
 
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        return raw[start_idx:end_idx + 1]
+
+    return raw
+
+
+def _analyze_with_claude(contract_text: str) -> dict:
     settings = get_settings()
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
     message = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         messages=[
-            {
-                "role": "user",
-                "content": f"Please review this contract:\n\n{contract_text}"
-            }
+            {"role": "user", "content": f"Please review this contract:\n\n{contract_text}"}
         ]
     )
 
-    raw = message.content[0].text.strip()
-
-    # Strip markdown fences if Claude adds them despite instructions
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
+    raw = _clean_json_response(message.content[0].text)
     result = json.loads(raw)
 
-    # Add token usage for cost tracking
     result["_meta"] = {
         "input_tokens": message.usage.input_tokens,
         "output_tokens": message.usage.output_tokens,
         "model": message.model,
     }
-
     return result
+
+
+def _analyze_with_gemini(contract_text: str) -> dict:
+    import google.generativeai as genai
+    settings = get_settings()
+    genai.configure(api_key=settings.gemini_api_key)
+
+    # Note: Gemini 3.5 Flash is a paid tier model. For the free tier,
+    # use "gemini-2.5-flash", "gemini-2.0-flash", or "gemini-3-flash-preview"
+    model = genai.GenerativeModel(
+        model_name="gemini-3.5-flash",
+        system_instruction=SYSTEM_PROMPT,
+    )
+
+    response = model.generate_content(
+        f"Please review this contract:\n\n{contract_text}",
+        generation_config={
+            "temperature": 0.2,
+            "max_output_tokens": 4000,
+            "response_mime_type": "application/json",
+            "response_schema": GEMINI_CONTRACT_SCHEMA, # <-- Swapped Pydantic for raw dict schema
+        },
+    )
+
+    # Clean and parse safely
+    raw = _clean_json_response(response.text)
+    result = json.loads(raw)
+
+    usage = getattr(response, "usage_metadata", None)
+    result["_meta"] = {
+        "input_tokens": getattr(usage, "prompt_token_count", 0) if usage else 0,
+        "output_tokens": getattr(usage, "candidates_token_count", 0) if usage else 0,
+        "model": "gemini-2.0-flash",
+    }
+    return result
+
+
+def analyze_contract(contract_text: str) -> dict:
+    """
+    Send contract text to the configured AI provider and get back a
+    structured risk analysis. Returns a parsed dict ready to store in Supabase.
+    """
+    provider = "gemini"
+
+    if provider == "mock":
+        return MOCK_RESULT.copy()
+
+    elif provider == "gemini":
+        try:
+            return _analyze_with_gemini(contract_text)
+        except Exception as e:
+            raise RuntimeError(f"Gemini analysis failed: {e}")
+
+    elif provider == "claude":
+        try:
+            return _analyze_with_claude(contract_text)
+        except Exception as e:
+            raise RuntimeError(f"Claude analysis failed: {e}")
+
+    else:
+        raise ValueError(f"Unknown AI_PROVIDER: {provider}. Use mock, gemini, or claude.")
 
 
 def get_flag_counts(result: dict) -> dict:

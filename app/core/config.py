@@ -6,9 +6,15 @@ class Settings(BaseSettings):
     # Anthropic
     anthropic_api_key: str = ""
 
+    # Gemini (free-tier fallback provider)
+    gemini_api_key: str = ""
+
     # Supabase
     supabase_url: str = ""
     supabase_service_key: str = ""
+
+    #admin
+    admin_emails: str = ""
 
     # Stripe
     stripe_secret_key: str = ""
