@@ -227,7 +227,7 @@ def _analyze_with_gemini(contract_text: str) -> dict:
     # Note: Gemini 3.5 Flash is a paid tier model. For the free tier,
     # use "gemini-2.5-flash", "gemini-2.0-flash", or "gemini-3-flash-preview"
     model = genai.GenerativeModel(
-        model_name="gemini-3.5-flash",
+        model_name="gemini-2.5-pro",
         system_instruction=SYSTEM_PROMPT,
     )
 
