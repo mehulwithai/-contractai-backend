@@ -14,83 +14,66 @@ def get_stripe():
     return stripe
 
 
+WHOP_CHECKOUT_URL = "https://whop.com/checkout/plan_RgYzPBJgecKVf"
+
+
 @router.post("/checkout")
 async def create_checkout_session(
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase)
 ):
     """
-    Create a Stripe Checkout session for the $49/mo plan.
-    Returns a URL to redirect the user to.
+    Return Whop Checkout session URL for the $10/mo Growth plan.
     """
-    settings = get_settings()
-    get_stripe()
-
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            mode="subscription",
-            line_items=[{"price": settings.stripe_price_id, "quantity": 1}],
-            success_url=f"{settings.frontend_url}/dashboard?payment=success",
-            cancel_url=f"{settings.frontend_url}/upgrade?payment=cancelled",
-            metadata={"user_id": user["id"], "email": user["email"]},
-            customer_email=user["email"],
-        )
-        return {"checkout_url": session.url}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to create checkout session: {str(e)}")
+    user_email = user.get("email", "")
+    user_id = user.get("id", "")
+    checkout_url = f"{WHOP_CHECKOUT_URL}?email={user_email}&metadata[user_id]={user_id}"
+    return {"checkout_url": checkout_url}
 
 
 @router.post("/webhook")
-async def stripe_webhook(
+async def whop_webhook(
     request: Request,
     supabase: Client = Depends(get_supabase)
 ):
     """
-    Stripe sends events here after payment.
-    We listen for checkout.session.completed to activate subscriptions,
-    and customer.subscription.deleted to deactivate them.
+    Handles Whop payment and membership webhooks to activate/cancel subscriptions in Supabase.
     """
-    settings = get_settings()
-    get_stripe()
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, settings.stripe_webhook_secret
-        )
+        body = await request.json()
     except Exception:
-        raise HTTPException(400, "Invalid webhook signature")
+        raise HTTPException(400, "Invalid JSON body")
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        user_id = session["metadata"].get("user_id")
-        subscription_id = session.get("subscription")
+    event_action = body.get("action") or body.get("event") or body.get("type")
+    data = body.get("data", body)
 
-        if user_id and subscription_id:
+    user_email = None
+    user_id = None
+    membership_id = data.get("id") or data.get("membership_id")
+
+    if isinstance(data.get("user"), dict):
+        user_email = data["user"].get("email")
+    elif data.get("email"):
+        user_email = data.get("email")
+
+    if data.get("metadata") and isinstance(data["metadata"], dict):
+        user_id = data["metadata"].get("user_id")
+
+    if event_action in ["membership.went_valid", "payment.succeeded", "membership.created", "checkout.session.completed"]:
+        if user_id:
             supabase.table("subscriptions").upsert({
                 "user_id": user_id,
-                "stripe_subscription_id": subscription_id,
-                "stripe_customer_id": session.get("customer"),
-                "plan": "starter",
+                "stripe_subscription_id": str(membership_id or f"whop_{user_id}"),
+                "stripe_customer_id": user_email or "whop_customer",
+                "plan": "growth",
                 "status": "active",
             }).execute()
 
-    elif event["type"] == "customer.subscription.deleted":
-        subscription_id = event["data"]["object"]["id"]
-        supabase.table("subscriptions") \
-            .update({"status": "cancelled"}) \
-            .eq("stripe_subscription_id", subscription_id) \
-            .execute()
-
-    elif event["type"] == "invoice.payment_failed":
-        subscription_id = event["data"]["object"].get("subscription")
-        if subscription_id:
+    elif event_action in ["membership.went_invalid", "membership.deleted", "payment.failed", "customer.subscription.deleted"]:
+        if user_id:
             supabase.table("subscriptions") \
-                .update({"status": "past_due"}) \
-                .eq("stripe_subscription_id", subscription_id) \
+                .update({"status": "cancelled"}) \
+                .eq("user_id", user_id) \
                 .execute()
 
     return {"received": True}
@@ -121,23 +104,6 @@ async def create_billing_portal(
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase)
 ):
-    """Create a Stripe billing portal session for managing subscription."""
-    settings = get_settings()
-    get_stripe()
+    """Return Whop customer orders portal for managing subscription."""
+    return {"portal_url": "https://whop.com/orders"}
 
-    sub = supabase.table("subscriptions") \
-        .select("stripe_customer_id") \
-        .eq("user_id", user["id"]) \
-        .execute()
-
-    if not sub.data:
-        raise HTTPException(404, "No subscription found")
-
-    try:
-        session = stripe.billing_portal.Session.create(
-            customer=sub.data[0]["stripe_customer_id"],
-            return_url=f"{settings.frontend_url}/dashboard",
-        )
-        return {"portal_url": session.url}
-    except Exception as e:
-        raise HTTPException(500, str(e))
