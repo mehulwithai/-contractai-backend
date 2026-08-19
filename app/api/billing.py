@@ -59,7 +59,7 @@ async def whop_webhook(
     if data.get("metadata") and isinstance(data["metadata"], dict):
         user_id = data["metadata"].get("user_id")
 
-    if event_action in ["membership.went_valid", "payment.succeeded", "membership.created", "checkout.session.completed"]:
+    if event_action in ["membership.activated", "membership.went_valid", "payment.succeeded", "membership.created", "checkout.session.completed"]:
         if user_id:
             supabase.table("subscriptions").upsert({
                 "user_id": user_id,
@@ -69,7 +69,7 @@ async def whop_webhook(
                 "status": "active",
             }).execute()
 
-    elif event_action in ["membership.went_invalid", "membership.deleted", "payment.failed", "customer.subscription.deleted"]:
+    elif event_action in ["membership.deactivated", "membership.went_invalid", "membership.deleted", "payment.failed", "customer.subscription.deleted"]:
         if user_id:
             supabase.table("subscriptions") \
                 .update({"status": "cancelled"}) \
