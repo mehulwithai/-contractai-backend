@@ -44,13 +44,15 @@ def check_usage_limit(user_id: str, user_email: str, supabase: Client) -> None:
         day=1, hour=0, minute=0, second=0, microsecond=0
     ).isoformat()
 
-    count = supabase.table("reviews") \
-        .select("id", count="exact") \
+    res = supabase.table("reviews") \
+        .select("id") \
         .eq("user_id", user_id) \
         .gte("created_at", start_of_month) \
         .execute()
 
-    if (count.count or 0) >= FREE_TIER_LIMIT:
+    review_count = len(res.data or [])
+
+    if review_count >= FREE_TIER_LIMIT:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail={
